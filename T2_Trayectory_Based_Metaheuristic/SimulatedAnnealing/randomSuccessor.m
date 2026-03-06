@@ -1,0 +1,18 @@
+function S = randomSuccessor (x,q)
+%%	x is a complete assignment
+%%	q is the queen to consider in order to generate new successors only by exchanging values of this queen with the rest of queens
+%%	S the best successor and cost
+
+    % 1. Seleccionar una reina diferente aleatoria
+    p = randi([1, length(x)]);
+    while p == q
+        p = randi([1, length(x)]);
+    end
+    
+    % 2. Generar el sucesor (S) intercambiando los valores en 'q' y 'p'
+    S = x;            % Copiamos el tablero
+    S(q) = x(p);      % Metemos la fila de 'p' en 'q'
+    S(p) = x(q);      % Metemos la fila que había en 'q' en 'p'
+   
+
+end 
