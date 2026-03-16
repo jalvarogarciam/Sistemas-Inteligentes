@@ -15,13 +15,14 @@ function [ best_sol , best_cost , log , num_gens ] = solve_bin_ga ( dist , slope
 % log 1 × K Best cost found at each generation (convergence trace)
 % num_gens 1 × 1 Total number of generations completed
 
-
+    t_start = tic;
+    
     n = length ( dist ) ;               % Número de segmentos de la ruta
     SoE_max = params (8) ;              % Máximo nivel de batería para el camión
     CO2_factor = params(12);            % Factor de conversión para pasar de kgCO2 a Kwh
 
-    % Precalculamos el coste en CO2 para cada segmento asumiendo que vamos en combustión
-    segmentsCost = zeros(n, 2);
+    % Precalculamos el coste en CO2 / kwh para cada segmento
+    segmentsCost = zeros(n, 2); % (co2, kwh);(co2, kwh)...
     for i = 1:n
         co2 = segment_kgCO2(dist(i), slope(i), speed(i), time_s(i), accel(i), params);
         segmentsCost(i, 1) = co2;
@@ -30,34 +31,34 @@ function [ best_sol , best_cost , log , num_gens ] = solve_bin_ga ( dist , slope
     
     
     % --- 2. Initialise population ---
-    pop_size = 100;
-    pop = rand(pop_size, n) < 0.05; % Solo un 5% de '1s' (eléctrico) al principio
-
-    best_sol = zeros (1 , n ) ;
-    best_cost = 1/evalInd(best_sol, segmentsCost, SoE_max);
+    pop_size = 300;
+    pop = rand(pop_size, n) < 0.01; % Solo un 5% de '1s' (eléctrico) al principio
+    
+    % La mejor solución inicial es no usar el motor eléctrico
+    [best_sol, best_fit] = evalInd(zeros (1 , n ), segmentsCost, SoE_max);
+    best_cost = 1/best_fit;
     
     log = [];
     num_gens = 0;
-    t_start = tic;
     
-    num_gens = 0;
+    
     while toc( t_start ) < time_limit - 0.01
         num_gens = num_gens + 1;
 
         % --- 3. Evaluate population
-        fitnesses = evalPop(pop, segmentsCost, SoE_max);
+        [pop, fitnesses] = evalPop(pop, segmentsCost, SoE_max);
         
         
         % Si hemos llegado a una mejor solución que la actual, lo registramos
         [best_fitness, bestIdx] = max(fitnesses);
         if best_cost > 1 / best_fitness
-            best_cost = 1 / best_fitness; % Update the best cost based on the best fitness
-            best_sol = pop(bestIdx, :);    % Store the best solution found
+            best_cost = 1 / best_fitness;
+            best_sol = pop(bestIdx, :);
         end
         
 
         % --- 4. Selection
-        k = round(length(fitnesses)/4); % Tamaño de los subgrupos a seleccionar en el torneo
+        k = round(length(fitnesses)*0.3); % Tamaño de los subgrupos a seleccionar en el torneo
         parentsIdxs = tournament(fitnesses, k);
 
         % --- 5. Crossover
@@ -69,14 +70,7 @@ function [ best_sol , best_cost , log , num_gens ] = solve_bin_ga ( dist , slope
         childs = mutate(childs, pMut);
 
         % --- 7. Elitism :
-        pop = childs; % La nueva generación sustituye a la antigua.
-        
-        % Introducimos nuestra mejor solución (si sigue siendo la mejor)
-        random_child_idx = 1;
-        random_child_cost = 1/evalInd(pop(random_child_idx,:), segmentsCost, SoE_max);
-        if best_cost < random_child_cost;
-            pop(random_child_idx, :) = best_sol; % Machacamos al primer indivíduo (a ciegas)
-        end
+        pop = combineGenerations(pop, childs, fitnesses, segmentsCost, SoE_max);
 
         
         % --- 8. Update best ---
@@ -94,15 +88,25 @@ end
 
 
 
-
-function fitness = evalInd(ind, segmentsCost, SoE_max)
+%{
+Evalúa (cuanto mayor, mejor) un indivíduo, asignando un valor inversamente 
+proporcional al sumatorio de los costes en CO2/kwh para cada tramo. 
+Además los corrige, de tal forma que no admite individuos irreales 
+(que rompan la restricción de la batería). Si se acaba la batería, pasa a combustión. 
+La nueva población de indivíduos corregidos es devuelta como primer parámetro 
+'new_pop', y el vector fila 'fitnesses', como segúndo parámetro, consistente 
+en el conjunto de la evaluación individual de cada elemento de 'pop'.
+%}
+function [new_ind, fitness] = evalInd(ind, segmentsCost, SoE_max)
 
         kgCO2 = 0;       % Acumilador de Co2, inicialmente no ha emitido CO2
-        SoE = SoE_max; % Kwh de batería, inicilmente la tiene al máximo
+        SoE = SoE_max;   % Kwh de batería, inicilmente la tiene al máximo
         
-        for i = 1:length(ind)
+        new_ind = ind;
 
-            if ind(i) == 1 % Está en eléctrico
+        for i = 1:length(new_ind)
+
+            if new_ind(i) == 1 % Está en eléctrico
                 
                 % Actualizamos el valor de la batería
                 SoE = SoE - segmentsCost(i,2); 
@@ -113,10 +117,10 @@ function fitness = evalInd(ind, segmentsCost, SoE_max)
                 kgCO2 = kgCO2 + segmentsCost(i,1);
             end
 
-            % Si inclumple la restricción de la batería, descartamos y pasamos al siguiente indivíduo
+            % Si inclumple la restricción de la batería, lo forzamos a cambiar a combustión
             if SoE < 0 
-                kgCO2 = inf;
-                break;
+                SoE = 0;
+                new_ind(i:end) = 0; % Pasamos a combustión 
             end
 
         end
@@ -124,21 +128,37 @@ function fitness = evalInd(ind, segmentsCost, SoE_max)
         fitness = 1/kgCO2; % Registramos la evaluación del indivíduo
 end
 
-function fitnesses = evalPop(pop, segmentsCost, SoE_max)
+
+
+
+%{
+Evalúa (cuanto mayor, mejor) una población indivíduo a indivíduo, asignando a 
+cada uno un valor inversamente proporcional al sumatorio de los costes en CO2/kwh
+para cada tramo. Además de evaluar estos indivíduos, los corrige,
+de tal forma que no admite individuos irreales (que rompan la restricción
+de la batería).  Si se acaba la batería, pasa a combustión.
+La nueva población de indivíduos corregidos es devuelta
+como primer parámetro 'new_pop', y el vector fila 'fitnesses', como segúndo
+parámetro, consistente en el conjunto de la evaluación individual de cada
+elemento de 'pop'.
+%}
+function [new_pop, fitnesses] = evalPop(pop, segmentsCost, SoE_max)
     % pop: Matriz de (pop_size x N) con 0s y 1s (1 = Eléctrico, 0 = Combustión)
     % segmentsCosts: Vector columna (N x 2) con el coste de CO2 y Kwh de cada tramo, de la forma (CO2, KWH)
 
     pop_size = height(pop);
 
     fitnesses = zeros(1, pop_size);
+    new_pop = pop;
 
     % Recorremos la población para evaluar todos los indivíduos
-    for j = 1:pop_size
+    for i = 1:pop_size
         
-        fitnesses(j) = evalInd(pop(j, :), segmentsCost, SoE_max);
+        [new_pop(i, :), fitnesses(i)] = evalInd(pop(i, :), segmentsCost, SoE_max);
     
     end
 end
+
 
 
 function parentsIdxs = tournament(fitnesses, k)
@@ -164,9 +184,12 @@ function parentsIdxs = tournament(fitnesses, k)
 end
 
 
-function childs = crossover(pop, parentsIdxs)
+
+function childs = crossover2poin(pop, parentsIdxs)
+
         
-    childs = zeros(size(pop));
+    [pop_size, n] = size(pop);
+    childs = zeros(pop_size, n);
     
     % Cruzamos cada pareja del bucle, lo recorremos de 2 en 2
     for i = 2:2:length(parentsIdxs)
@@ -174,12 +197,12 @@ function childs = crossover(pop, parentsIdxs)
         father = pop(parentsIdxs(i-1), :);
         mother = pop(parentsIdxs(i), :);
 
-        % Realizar el cruce de los padres
-        crossPoint = randi([1, length(father)-1]); % Seleccionar un punto de cruce
+        % Seleccionamos 2 puntos de cruce completamente aleatorios en cada cruce
+        cpts = sort(randperm(n, 2));
 
         % Creamos los 2 hijos
-        childs(i-1, :) = [father(1:crossPoint), mother(crossPoint+1:end)]; % Más parecido al padre
-        childs(i, :)   = [mother(1:crossPoint), father(crossPoint+1:end)]; % Más parecido a la madre
+        childs(i-1, :) = [father(1:cpts(1)), mother(cpts(1)+1:cpts(2)), father(cpts(2)+1:end)]; % Más parecido al padre
+        childs(i, :)   = [mother(1:cpts(1)), father(cpts(1)+1:cpts(2)), mother(cpts(2)+1:end)]; % Más parecido a la madre
     end
 
 end
@@ -196,3 +219,25 @@ function mutated_childs = mutate(childs, pMut)
     
 end
 
+function elite = combineGenerations(pop, childs, popFitness, segmentsCost, SoE_max)
+    elite = childs; % La generación de los hijos toma presencia
+
+    parentsAmount = round(size(elite, 1) * 0.3); % Cantidad de padres en la nueva poblacion
+
+    % Seleccionamos los mejores padres a mezclar
+    [parentsFitnesses, parentsIdx] = maxk(popFitness, parentsAmount); 
+
+    % Los introducimos al principio de la población, siempre y cuando se mejore cada indivíduo
+    for i = 1:parentsAmount
+        parent = pop(parentsIdx(i), :);
+        parentFitness = parentsFitnesses(i);
+
+        [~, childFitness ] = evalInd(elite(i,:), segmentsCost, SoE_max);
+
+        if (parentFitness > childFitness)
+            elite(i,:) = parent;
+        end
+    end
+
+    
+end
