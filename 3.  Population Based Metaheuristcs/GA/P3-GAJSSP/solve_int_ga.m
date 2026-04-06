@@ -38,7 +38,7 @@ while toc(t_start) < time_limit - 0.5
     childs = crossover_jox(pop, parentsIdxs);
     
     % --- 7. Mutation ---
-    pMut = 0.35; % Probabilidad de mutación para cada gen
+    pMut = 0.3; % Probabilidad de mutación para cada gen
     childs = mutate(childs, pMut);
 
 
